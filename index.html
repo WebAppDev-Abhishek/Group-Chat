@@ -49,6 +49,12 @@
             <h2 style="margin-top:0;">Welcome to the Common Group</h2>
             <div id="userIdBox" style="margin:10px 0;"></div>
             <div id="groupList" style="margin:10px 0;"></div>
+            <div id="peerBox" style="margin:10px 0;">
+                <label for="peerSelect">Direct message to:</label>
+                <select id="peerSelect"><option value="">-- Select User --</option></select>
+                <span id="p2pStatus" style="font-size:0.9em;color:#1976d2;margin-left:8px;"></span>
+            </div>
+            <div id="connStatus" style="color:#d32f2f;font-size:0.95em;margin-bottom:6px;"></div>
             <div id="chatBox" style="width:100%;max-width:400px;flex:1 1 0;margin:20px 0 0 0;display:none;display:flex;flex-direction:column;">
                 <div id="messages" style="flex:1 1 0;height:auto;overflow-y:auto;border:1px solid #ccc;background:#f7f7f7;padding:10px 5px 10px 10px;margin-bottom:10px;border-radius:6px;"></div>
                 <form id="chatForm" style="display:flex;gap:5px;">
@@ -109,34 +115,38 @@
             const data = await res.json();
             document.getElementById('groupList').innerHTML = 'Group Members: <b>' + data.users.join(', ') + '</b>';
         }
+        // --- WebRTC P2P logic ---
+        let peerConnection = null;
+        let dataChannel = null;
+        let selectedPeer = '';
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
         function setupSocket() {
             socket = io();
             socket.on('connect', () => {
+                document.getElementById('connStatus').textContent = 'Connected to server.';
                 socket.emit('join', userId);
                 document.getElementById('chatBox').style.display = '';
-                // Send location after joining (no map display)
-                if (navigator.geolocation) {
-                    navigator.geolocation.getCurrentPosition(function(pos) {
-                        socket.emit('location', {
-                            userId,
-                            lat: pos.coords.latitude,
-                            lng: pos.coords.longitude
-                        });
-                    });
-                    navigator.geolocation.watchPosition(function(pos) {
-                        socket.emit('location', {
-                            userId,
-                            lat: pos.coords.latitude,
-                            lng: pos.coords.longitude
-                        });
-                    });
-                }
+            });
+            socket.on('disconnect', () => {
+                document.getElementById('connStatus').textContent = 'Disconnected from server!';
+            });
+            socket.on('connect_error', (err) => {
+                document.getElementById('connStatus').textContent = 'Connection error: ' + err.message;
+                console.error('Socket.IO connect_error:', err);
             });
             socket.on('userlist', users => {
                 document.getElementById('groupList').innerHTML = 'Group Members: <b>' + users.join(', ') + '</b>';
                 const logDiv = document.getElementById('user-console-log');
                 logDiv.textContent = 'API: Current users: ' + users.join(', ');
-                console.log('API: Current users:', users);
+                // Update peer select dropdown
+                const sel = document.getElementById('peerSelect');
+                const prev = sel.value;
+                sel.innerHTML = '<option value="">-- Select User --</option>';
+                users.forEach(u => {
+                    if (u !== userId) sel.innerHTML += `<option value="${u}">${u}</option>`;
+                });
+                sel.value = prev && users.includes(prev) ? prev : '';
             });
             socket.on('clear', () => {
                 document.getElementById('messages').innerHTML = '';
@@ -144,11 +154,76 @@
             socket.on('chat', ({ userId: from, msg }) => {
                 addMessage(from, msg);
             });
-            // No user markers on static image
-            socket.on('locations', locations => {
-                // No-op: can't show markers on static image
+            // --- WebRTC signaling ---
+            socket.on('signal', async ({ from, data }) => {
+                if (!peerConnection) await startPeerConnection(from, false);
+                if (data.sdp) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                    if (data.sdp.type === 'offer') {
+                        const answer = await peerConnection.createAnswer();
+                        await peerConnection.setLocalDescription(answer);
+                        socket.emit('signal', { to: from, data: { sdp: peerConnection.localDescription } });
+                    }
+                } else if (data.candidate) {
+                    try { await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch(e) {}
+                }
             });
         }
+
+        async function startPeerConnection(peerId, isInitiator) {
+            if (peerConnection) peerConnection.close();
+            peerConnection = new RTCPeerConnection(rtcConfig);
+            selectedPeer = peerId;
+            document.getElementById('p2pStatus').textContent = 'Connecting to ' + peerId + '...';
+            // Data channel
+            if (isInitiator) {
+                dataChannel = peerConnection.createDataChannel('chat');
+                setupDataChannel();
+            } else {
+                peerConnection.ondatachannel = (e) => {
+                    dataChannel = e.channel;
+                    setupDataChannel();
+                };
+            }
+            peerConnection.onicecandidate = (e) => {
+                if (e.candidate) {
+                    socket.emit('signal', { to: peerId, data: { candidate: e.candidate } });
+                }
+            };
+            if (isInitiator) {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                socket.emit('signal', { to: peerId, data: { sdp: peerConnection.localDescription } });
+            }
+        }
+
+        function setupDataChannel() {
+            dataChannel.onopen = () => {
+                document.getElementById('p2pStatus').textContent = 'P2P chat ready with ' + selectedPeer;
+            };
+            dataChannel.onclose = () => {
+                document.getElementById('p2pStatus').textContent = 'P2P chat closed';
+            };
+            dataChannel.onerror = (e) => {
+                document.getElementById('p2pStatus').textContent = 'P2P error';
+            };
+            dataChannel.onmessage = (e) => {
+                addMessage(selectedPeer, '[P2P] ' + e.data);
+            };
+        }
+
+        document.getElementById('peerSelect').addEventListener('change', async function() {
+            const peerId = this.value;
+            if (!peerId) {
+                if (peerConnection) peerConnection.close();
+                peerConnection = null;
+                dataChannel = null;
+                selectedPeer = '';
+                document.getElementById('p2pStatus').textContent = '';
+                return;
+            }
+            await startPeerConnection(peerId, true);
+        });
         function addMessage(from, msg) {
             if (typeof from === 'undefined' || typeof msg === 'undefined' || from === null || msg === null) return;
             const messages = document.getElementById('messages');
@@ -166,9 +241,25 @@
             e.preventDefault();
             const input = document.getElementById('chatInput');
             const msg = input.value.trim();
-            if(msg && socket) {
-                socket.emit('chat', msg);
-                input.value = '';
+            if (!msg) return;
+            try {
+                // If P2P channel is open, send direct
+                if (dataChannel && dataChannel.readyState === 'open') {
+                    dataChannel.send(msg);
+                    addMessage('You→' + selectedPeer, '[P2P] ' + msg);
+                    input.value = '';
+                    return;
+                }
+                // Otherwise, send to group
+                if(socket && socket.connected) {
+                    socket.emit('chat', msg);
+                    input.value = '';
+                } else {
+                    document.getElementById('connStatus').textContent = 'Cannot send: not connected to server.';
+                }
+            } catch (err) {
+                document.getElementById('connStatus').textContent = 'Send error: ' + err.message;
+                console.error('Send error:', err);
             }
         });
         joinGroup();

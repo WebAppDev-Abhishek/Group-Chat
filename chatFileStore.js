@@ -7,10 +7,7 @@ const MSG_FILE = path.join(__dirname, 'messages.json');
 function loadMessages() {
     try {
         const data = fs.readFileSync(MSG_FILE, 'utf8');
-        const arr = JSON.parse(data);
-        // Only keep messages from the last 60 seconds
-        const now = Date.now();
-        return arr.filter(m => now - m.time < 60000);
+        return JSON.parse(data);
     } catch (e) {
         return [];
     }
